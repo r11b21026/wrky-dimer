@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>分子軌跡播放器 (陽春版)</title>
+  <title>分子軌跡播放器</title>
   <!-- Tailwind CSS & Lucide Icons -->
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
@@ -33,7 +33,7 @@
   <!-- 3D 渲染視窗 -->
   <div id="viewport" class="w-full h-full absolute inset-0 cursor-grab active:cursor-grabbing"></div>
 
-  <!-- 頂部結構選單與重設視角 -->
+  <!-- 頂部選單與控制 -->
   <header class="absolute top-3 left-3 right-3 z-20 flex items-center justify-between pointer-events-none">
     <div class="bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-xl px-3 py-1.5 flex items-center space-x-2 pointer-events-auto shadow-lg max-w-sm w-full">
       <i data-lucide="file" class="w-4 h-4 text-cyan-400 shrink-0"></i>
@@ -55,7 +55,7 @@
     </div>
   </div>
 
-  <!-- 底部精簡軌跡播放控制器 -->
+  <!-- 底部軌跡播放控制器 -->
   <footer id="bottom-timeline" class="hidden absolute bottom-4 left-3 right-3 sm:left-12 sm:right-12 z-20 pointer-events-none flex flex-col items-center">
     <div class="bg-slate-900/95 backdrop-blur-md border border-slate-700/80 w-full max-w-lg rounded-2xl px-4 py-2.5 shadow-2xl pointer-events-auto flex flex-col gap-2">
       <!-- 幀數拉桿 -->
@@ -106,10 +106,13 @@
       totalFrames: 1,
       currentFrame: 0,
       isPlaying: false,
-      loopMode: 'loop', // 'loop' | 'rock' | 'once'
+      loopMode: 'loop',
       direction: 1,
       timerId: null,
-      fps: 15
+      fps: 15,
+      origSS: null,
+      ssSchemeIds: null,
+      strandT: new Map()
     };
 
     lucide.createIcons();
@@ -140,6 +143,183 @@
     function hideLoading() {
       dom.loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
     }
+
+    // --- 二級結構演算法 (DSSP & 著色配置) ---
+
+    // 註冊 PyMOL 風格配色：Helix 紅 (0xFF0000) / Sheet 黃 (0xFFFF00) / Loop 綠 (0x00E000)
+    function registerCustomColorSchemes() {
+      const makeSS = (helix, sheet, loop) => {
+        return function () {
+          this.atomColor = function (atom) {
+            const ss = atom.sstruc;
+            if (ss === 'h' || ss === 'g' || ss === 'i') return helix;
+            if (ss === 'e' || ss === 'b') return sheet;
+            return loop;
+          };
+        };
+      };
+
+      appState.ssSchemeIds = {
+        pymol_ss: NGL.ColormakerRegistry.addScheme(makeSS(0xFF0000, 0xFFFF00, 0x00E000), 'pymol_ss')
+      };
+    }
+
+    // β-sheet 末端箭頭渲染修補
+    function installArrowPatch() {
+      try {
+        const Cart = NGL.RepresentationRegistry.get('cartoon');
+        if (!Cart || Cart.prototype.__arrowPatched) return;
+        const origGetSpline = Cart.prototype.getSpline;
+        Cart.prototype.getSpline = function (polymer) {
+          const spline = origGetSpline.call(this, polymer);
+          const origSize = spline.getSubdividedSize;
+          spline.getSubdividedSize = function (params) {
+            const out = origSize.call(this, params);
+            if (!polymer.isProtein()) return out;
+            try {
+              const size = out.size, m = this.subdiv, n = polymer.residueCount;
+              const st = polymer.structure, rp = st.getResidueProxy();
+              const HEAD = 1.8;
+              let runStart = -1;
+              for (let r = 0; r <= n; r++) {
+                let isE = false;
+                if (r < n) { rp.index = polymer.residueIndexStart + r; isE = (rp.sstruc === 'e' || rp.sstruc === 'b'); }
+                if (isE) { if (runStart < 0) runStart = r; continue; }
+                if (runStart >= 0) {
+                  const b = r - 1;
+                  if (b - runStart >= 1) {
+                    const i0 = (b - 1) * m + Math.floor(m / 2);
+                    const i1 = Math.min(size.length - 1, b * m + Math.floor(m / 2));
+                    const S = size[b * m] * HEAD;
+                    const tipRef = (b + 1) * m < size.length ? size[Math.min(size.length - 1, (b + 1) * m)] : size[b * m] * 0.1;
+                    const tip = Math.min(tipRef, S * 0.3);
+                    for (let i = i0; i <= i1; i++) size[i] = S + (tip - S) * ((i - i0) / Math.max(1, i1 - i0));
+                  }
+                  runStart = -1;
+                }
+              }
+            } catch (e) { console.warn('箭頭修補失敗', e); }
+            return out;
+          };
+          return spline;
+        };
+        Cart.prototype.__arrowPatched = true;
+      } catch (e) { console.warn('無法安裝箭頭修補', e); }
+    }
+
+    // Kabsch-Sander DSSP 二級結構氫鍵判定運算
+    function computeDSSP(structure) {
+      const R = [];
+      structure.eachResidue(r => {
+        if (!r.isProtein()) return;
+        const at = {};
+        r.eachAtom(a => {
+          const n = a.atomname.trim();
+          if (n === 'N' || n === 'CA' || n === 'C' || n === 'O') at[n] = [a.x, a.y, a.z];
+        });
+        if (at.N && at.CA && at.C && at.O) {
+          R.push({ index: r.index, chain: r.chainIndex, pro: (r.resname || '').trim().toUpperCase() === 'PRO', ...at });
+        }
+      });
+      const n = R.length;
+      const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+      const link = new Array(n).fill(false);
+      for (let i = 0; i < n - 1; i++) {
+        link[i] = R[i].chain === R[i + 1].chain && dist(R[i].C, R[i + 1].N) < 2.5;
+      }
+      const contiguous = (a, b) => {
+        if (a < 0 || b >= n) return false;
+        for (let k = a; k < b; k++) if (!link[k]) return false;
+        return true;
+      };
+
+      for (let i = 1; i < n; i++) {
+        if (!link[i - 1] || R[i].pro) continue;
+        const c = R[i - 1].C, o = R[i - 1].O;
+        const dx = c[0] - o[0], dy = c[1] - o[1], dz = c[2] - o[2];
+        const l = Math.hypot(dx, dy, dz) || 1;
+        R[i].H = [R[i].N[0] + dx / l, R[i].N[1] + dy / l, R[i].N[2] + dz / l];
+      }
+
+      const acc = Array.from({ length: n }, () => new Set());
+      for (let d = 0; d < n; d++) {
+        if (!R[d].H) continue;
+        for (let a = 0; a < n; a++) {
+          if (Math.abs(a - d) < 2) continue;
+          if (dist(R[d].CA, R[a].CA) > 9.0) continue;
+          const rON = dist(R[a].O, R[d].N), rCH = dist(R[a].C, R[d].H);
+          const rOH = dist(R[a].O, R[d].H), rCN = dist(R[a].C, R[d].N);
+          const E = 0.084 * 332 * (1 / rON + 1 / rCH - 1 / rOH - 1 / rCN);
+          if (E < -0.5) acc[d].add(a);
+        }
+      }
+      const hb = (a, d) => a >= 0 && d >= 0 && a < n && d < n && acc[d].has(a);
+
+      const ss = new Array(n).fill('c');
+
+      const markHelix = (turn, ch) => {
+        const t = new Array(n).fill(false);
+        for (let i = 0; i + turn < n; i++) t[i] = contiguous(i, i + turn) && hb(i, i + turn);
+        for (let i = 1; i + turn < n; i++) {
+          if (t[i - 1] && t[i]) for (let k = i; k < i + turn; k++) ss[k] = ch;
+        }
+      };
+      markHelix(5, 'i');
+      markHelix(3, 'g');
+
+      const E = new Array(n).fill(false);
+      const bridges = [];
+      for (let i = 1; i < n - 1; i++) {
+        if (!contiguous(i - 1, i + 1)) continue;
+        for (let j = i + 3; j < n - 1; j++) {
+          if (!contiguous(j - 1, j + 1)) continue;
+          if (dist(R[i].CA, R[j].CA) > 8.0) continue;
+          const par = (hb(i - 1, j) && hb(j, i + 1)) || (hb(j - 1, i) && hb(i, j + 1));
+          const anti = (hb(i, j) && hb(j, i)) || (hb(i - 1, j + 1) && hb(j - 1, i + 1));
+          if (par) bridges.push([i, j, 'p']);
+          if (anti) bridges.push([i, j, 'a']);
+        }
+      }
+      const bset = new Set(bridges.map(b => b.join(',')));
+      bridges.forEach(([i, j, t]) => {
+        const nj = t === 'p' ? j + 1 : j - 1;
+        if (bset.has([i + 1, nj, t].join(',')) || bset.has([i - 1, t === 'p' ? j - 1 : j + 1, t].join(','))) {
+          E[i] = E[j] = true;
+        }
+      });
+      for (let i = 1; i < n - 1; i++) if (!E[i] && E[i - 1] && E[i + 1] && link[i - 1] && link[i]) E[i] = true;
+      for (let i = 0; i < n; i++) if (E[i]) ss[i] = 'e';
+
+      markHelix(4, 'h');
+
+      const tri = ss.map(c => (c === 'h' || c === 'g' || c === 'i') ? 'h' : (c === 'e' ? 'e' : 'c'));
+      const minLen = { h: 4, e: 2 };
+      for (let i = 0; i < n;) {
+        let j = i;
+        while (j < n && tri[j] === tri[i] && (j === i || link[j - 1])) j++;
+        if (tri[i] !== 'c' && (j - i) < minLen[tri[i]]) for (let k = i; k < j; k++) tri[k] = 'c';
+        i = j;
+      }
+      return R.map((r, k) => ({ index: r.index, ss: tri[k] }));
+    }
+
+    function applySecondaryStructure() {
+      if (!appState.component) return;
+      const st = appState.component.structure;
+      const store = st.residueStore;
+      if (!store || !store.sstruc) return;
+      if (!appState.origSS) appState.origSS = new Uint8Array(store.sstruc);
+      try {
+        const result = computeDSSP(st);
+        st.eachResidue(r => { if (r.isProtein()) store.sstruc[r.index] = 'c'.charCodeAt(0); });
+        result.forEach(({ index, ss }) => { store.sstruc[index] = ss.charCodeAt(0); });
+      } catch (e) {
+        store.sstruc.set(appState.origSS);
+      }
+    }
+
+    // --- 播放與幀數控制 ---
 
     function setFrame(targetFrame) {
       if (!appState.trajectory) return;
@@ -213,7 +393,8 @@
       else startPlayback();
     }
 
-    // 載入結構與基本外觀 (蛋白質 Cartoon + 核酸 Cartoon + 鋅離子球狀)
+    // --- 結構載入與表示法設定 ---
+
     async function loadPdbFile(url) {
       stopPlayback();
       showLoading(`載入結構中: ${url}`);
@@ -227,31 +408,47 @@
           asTrajectory: true
         });
         appState.component = comp;
+        appState.origSS = null;
 
-        // 蛋白質主體樣式
+        // 殘基命名相容性替換
+        comp.structure.eachResidue(r => {
+          const rn = (r.resname || '').trim().toUpperCase();
+          if (rn === 'CYM') r.resname = 'CYS';
+          if (rn === 'HIE' || rn === 'HID' || rn === 'HIP') r.resname = 'HIS';
+        });
+
+        // 執行 DSSP 重算二級結構
+        applySecondaryStructure();
+
+        // 蛋白質 Cartoon 表示法（套用 PyMOL SS 配色與細緻度參數）
         comp.addRepresentation('cartoon', {
-          sele: 'protein',
-          colorScheme: 'residueindex',
-          opacity: 1.0
+          sele: 'protein and not hydrogen',
+          colorScheme: appState.ssSchemeIds.pymol_ss,
+          aspectRatio: 5,
+          subdiv: 12,
+          radialSegments: 20,
+          capped: true,
+          smoothSheet: true
         });
 
         // 核酸 DNA 樣式
         comp.addRepresentation('cartoon', {
-          sele: 'nucleic',
+          sele: 'nucleic and not protein and not hydrogen',
           color: '#7dd3fc',
-          opacity: 1.0
+          aspectRatio: 4,
+          subdiv: 12
         });
 
-        // 鋅離子或其它雜原子 (Spacefill)
+        // 鋅離子 (ZN)
         comp.addRepresentation('spacefill', {
           sele: 'zinc or _ZN or :ZN or [ZN]',
           color: '#94a3b8',
-          scale: 0.4
+          scale: 0.35
         });
 
         comp.autoView(500);
 
-        // 初始化軌跡
+        // 初始化軌跡監聽
         const trajComp = comp.addTrajectory();
         const trajectory = trajComp.trajectory;
         appState.trajectory = trajectory;
@@ -281,7 +478,7 @@
       }
     }
 
-    // 自動掃描 GitHub Pages 目錄下的 .pdb / .pdb.gz 檔案
+    // 自動搜尋 GitHub Pages 儲存庫根目錄檔案
     async function scanFolderFiles() {
       const urlParams = new URLSearchParams(window.location.search);
       const specifiedFile = urlParams.get('file') || urlParams.get('pdb');
@@ -350,6 +547,7 @@
       });
 
       window.addEventListener('keydown', (e) => {
+        if (['INPUT', 'SELECT'].includes(e.target.tagName)) return;
         if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
         else if (e.code === 'ArrowRight') dom.btnNextFrame.click();
         else if (e.code === 'ArrowLeft') dom.btnPrevFrame.click();
@@ -358,9 +556,16 @@
     }
 
     window.addEventListener('load', () => {
+      registerCustomColorSchemes();
+      installArrowPatch();
+
       appState.stage = new NGL.Stage('viewport', {
         backgroundColor: '#0b0f19',
-        cameraType: 'perspective'
+        cameraType: 'perspective',
+        ambientColor: 0xffffff,
+        ambientIntensity: 0.55,
+        lightColor: 0xffffff,
+        lightIntensity: 0.95
       });
 
       window.addEventListener('resize', () => appState.stage.handleResize());
