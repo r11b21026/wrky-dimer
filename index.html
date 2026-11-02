@@ -1,1 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>分子軌跡播放器 (陽春版)</title>
+  <!-- Tailwind CSS & Lucide Icons -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <!-- NGL Viewer WebGL 引擎 -->
+  <script src="https://cdn.jsdelivr.net/npm/ngl@2.0.0-dev.37/dist/ngl.js"></script>
 
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #0b0f19;
+      color: #e2e8f0;
+      user-select: none;
+      touch-action: none;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    input[type=range] {
+      accent-color: #38bdf8;
+    }
+  </style>
+</head>
+<body class="w-screen h-screen relative bg-[#0b0f19]">
+
+  <!-- 3D 渲染視窗 -->
+  <div id="viewport" class="w-full h-full absolute inset-0 cursor-grab active:cursor-grabbing"></div>
+
+  <!-- 頂部結構選單與重設視角 -->
+  <header class="absolute top-3 left-3 right-3 z-20 flex items-center justify-between pointer-events-none">
+    <div class="bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-xl px-3 py-1.5 flex items-center space-x-2 pointer-events-auto shadow-lg max-w-sm w-full">
+      <i data-lucide="file" class="w-4 h-4 text-cyan-400 shrink-0"></i>
+      <select id="file-selector" class="bg-slate-800 border border-slate-700 text-cyan-200 text-xs rounded-lg px-2 py-1 w-full truncate focus:outline-none">
+        <option value="" disabled selected>搜尋結構檔案中...</option>
+      </select>
+    </div>
+
+    <button id="btn-reset-view" title="重設整體視角 (R)" class="bg-slate-900/90 backdrop-blur-md border border-slate-700/80 hover:bg-slate-800 text-slate-300 hover:text-white p-2 rounded-xl text-xs pointer-events-auto transition shadow-lg shrink-0">
+      <i data-lucide="maximize" class="w-4 h-4"></i>
+    </button>
+  </header>
+
+  <!-- 讀取狀態遮罩 -->
+  <div id="loading-overlay" class="absolute inset-0 z-50 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center transition-opacity duration-200 pointer-events-none">
+    <div class="bg-slate-900 border border-cyan-500/40 rounded-2xl p-5 flex flex-col items-center space-y-2.5 shadow-2xl">
+      <div class="w-8 h-8 border-3 border-cyan-500/30 border-t-cyan-400 rounded-full animate-spin"></div>
+      <div class="text-xs font-mono text-cyan-300 font-bold" id="loading-text">載入結構中...</div>
+    </div>
+  </div>
+
+  <!-- 底部精簡軌跡播放控制器 -->
+  <footer id="bottom-timeline" class="hidden absolute bottom-4 left-3 right-3 sm:left-12 sm:right-12 z-20 pointer-events-none flex flex-col items-center">
+    <div class="bg-slate-900/95 backdrop-blur-md border border-slate-700/80 w-full max-w-lg rounded-2xl px-4 py-2.5 shadow-2xl pointer-events-auto flex flex-col gap-2">
+      <!-- 幀數拉桿 -->
+      <div class="flex items-center space-x-2.5 w-full font-mono text-xs">
+        <span class="text-cyan-300 w-8 text-right" id="slider-curr-frame">0</span>
+        <input id="trajectory-slider" type="range" min="0" max="0" value="0" step="1" 
+               class="flex-1 h-1.5 bg-slate-700 rounded-lg appearance-none cursor-pointer focus:outline-none" />
+        <span class="text-slate-400 w-8 text-left" id="slider-total-frame">0</span>
+      </div>
+
+      <!-- 播放控制按鈕列 -->
+      <div class="flex items-center justify-between w-full">
+        <!-- 循環模式 -->
+        <button id="btn-loop-mode" class="px-2 py-1 rounded-lg text-xs font-mono bg-slate-800 border border-slate-700 text-cyan-400 hover:text-white transition flex items-center space-x-1">
+          <i data-lucide="repeat" class="w-3 h-3"></i>
+          <span id="loop-label">循環</span>
+        </button>
+
+        <!-- 播放/暫停與前後步進 -->
+        <div class="flex items-center space-x-1">
+          <button id="btn-first-frame" class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition">
+            <i data-lucide="skip-back" class="w-4 h-4"></i>
+          </button>
+          <button id="btn-prev-frame" class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition">
+            <i data-lucide="step-back" class="w-4 h-4"></i>
+          </button>
+          <button id="btn-play" class="p-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold transition shadow-md active:scale-95 mx-1">
+            <i id="play-icon" data-lucide="play" class="w-4 h-4 fill-current"></i>
+          </button>
+          <button id="btn-next-frame" class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition">
+            <i data-lucide="step-forward" class="w-4 h-4"></i>
+          </button>
+          <button id="btn-last-frame" class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition">
+            <i data-lucide="skip-forward" class="w-4 h-4"></i>
+          </button>
+        </div>
+
+        <div class="w-12"></div>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    const appState = {
+      stage: null,
+      component: null,
+      trajectory: null,
+      totalFrames: 1,
+      currentFrame: 0,
+      isPlaying: false,
+      loopMode: 'loop', // 'loop' | 'rock' | 'once'
+      direction: 1,
+      timerId: null,
+      fps: 15
+    };
+
+    lucide.createIcons();
+
+    const dom = {
+      fileSelector: document.getElementById('file-selector'),
+      loadingOverlay: document.getElementById('loading-overlay'),
+      loadingText: document.getElementById('loading-text'),
+      bottomTimeline: document.getElementById('bottom-timeline'),
+      slider: document.getElementById('trajectory-slider'),
+      sliderCurr: document.getElementById('slider-curr-frame'),
+      sliderTotal: document.getElementById('slider-total-frame'),
+      btnPlay: document.getElementById('btn-play'),
+      btnPrevFrame: document.getElementById('btn-prev-frame'),
+      btnNextFrame: document.getElementById('btn-next-frame'),
+      btnFirstFrame: document.getElementById('btn-first-frame'),
+      btnLastFrame: document.getElementById('btn-last-frame'),
+      btnLoopMode: document.getElementById('btn-loop-mode'),
+      loopLabel: document.getElementById('loop-label'),
+      btnResetView: document.getElementById('btn-reset-view')
+    };
+
+    function showLoading(text) {
+      dom.loadingText.textContent = text;
+      dom.loadingOverlay.classList.remove('opacity-0', 'pointer-events-none');
+    }
+
+    function hideLoading() {
+      dom.loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
+    }
+
+    function setFrame(targetFrame) {
+      if (!appState.trajectory) return;
+      const maxF = appState.totalFrames - 1;
+      let f = Math.max(0, Math.min(targetFrame, maxF));
+
+      appState.currentFrame = f;
+      appState.trajectory.setFrame(f);
+
+      dom.slider.value = f;
+      dom.sliderCurr.textContent = f;
+    }
+
+    function stepFrame(step) {
+      if (appState.totalFrames <= 1) return;
+      let next = appState.currentFrame + step;
+      const maxF = appState.totalFrames - 1;
+
+      if (appState.loopMode === 'loop') {
+        if (next > maxF) next = 0;
+        if (next < 0) next = maxF;
+      } else if (appState.loopMode === 'rock') {
+        if (next > maxF) {
+          appState.direction = -1;
+          next = maxF - 1;
+        } else if (next < 0) {
+          appState.direction = 1;
+          next = 1;
+        }
+      } else if (appState.loopMode === 'once') {
+        if (next > maxF || next < 0) {
+          stopPlayback();
+          setFrame(next > maxF ? maxF : 0);
+          return;
+        }
+      }
+
+      setFrame(next);
+    }
+
+    function updatePlayIcon(playing) {
+      const icon = dom.btnPlay.querySelector('i');
+      if (!icon) return;
+      icon.setAttribute('data-lucide', playing ? 'pause' : 'play');
+      lucide.createIcons();
+    }
+
+    function startPlayback() {
+      if (appState.totalFrames <= 1) return;
+      stopPlayback();
+      appState.isPlaying = true;
+      updatePlayIcon(true);
+
+      const intervalMs = Math.round(1000 / appState.fps);
+      appState.timerId = setInterval(() => {
+        stepFrame(appState.direction);
+      }, intervalMs);
+    }
+
+    function stopPlayback() {
+      appState.isPlaying = false;
+      if (appState.timerId) {
+        clearInterval(appState.timerId);
+        appState.timerId = null;
+      }
+      updatePlayIcon(false);
+    }
+
+    function togglePlay() {
+      if (appState.isPlaying) stopPlayback();
+      else startPlayback();
+    }
+
+    // 載入結構與基本外觀 (蛋白質 Cartoon + 核酸 Cartoon + 鋅離子球狀)
+    async function loadPdbFile(url) {
+      stopPlayback();
+      showLoading(`載入結構中: ${url}`);
+      dom.bottomTimeline.classList.add('hidden');
+
+      try {
+        appState.stage.removeAllComponents();
+
+        const comp = await appState.stage.loadFile(url, {
+          defaultRepresentation: false,
+          asTrajectory: true
+        });
+        appState.component = comp;
+
+        // 蛋白質主體樣式
+        comp.addRepresentation('cartoon', {
+          sele: 'protein',
+          colorScheme: 'residueindex',
+          opacity: 1.0
+        });
+
+        // 核酸 DNA 樣式
+        comp.addRepresentation('cartoon', {
+          sele: 'nucleic',
+          color: '#7dd3fc',
+          opacity: 1.0
+        });
+
+        // 鋅離子或其它雜原子 (Spacefill)
+        comp.addRepresentation('spacefill', {
+          sele: 'zinc or _ZN or :ZN or [ZN]',
+          color: '#94a3b8',
+          scale: 0.4
+        });
+
+        comp.autoView(500);
+
+        // 初始化軌跡
+        const trajComp = comp.addTrajectory();
+        const trajectory = trajComp.trajectory;
+        appState.trajectory = trajectory;
+
+        const handleCount = (count) => {
+          if (count > 1) {
+            appState.totalFrames = count;
+            dom.slider.max = count - 1;
+            dom.sliderTotal.textContent = String(count - 1);
+            dom.bottomTimeline.classList.remove('hidden');
+            setFrame(0);
+            startPlayback();
+          } else {
+            appState.totalFrames = 1;
+            dom.bottomTimeline.classList.add('hidden');
+          }
+        };
+
+        trajectory.signals.countChanged.add(handleCount);
+        handleCount(trajectory.frameCount || 1);
+
+      } catch (err) {
+        console.error('載入失敗:', err);
+        alert('檔案載入失敗，請確認該檔案是否存在於專案中。');
+      } finally {
+        hideLoading();
+      }
+    }
+
+    // 自動掃描 GitHub Pages 目錄下的 .pdb / .pdb.gz 檔案
+    async function scanFolderFiles() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const specifiedFile = urlParams.get('file') || urlParams.get('pdb');
+      if (specifiedFile) {
+        dom.fileSelector.innerHTML = `<option value="${specifiedFile}">${specifiedFile}</option>`;
+        loadPdbFile(specifiedFile);
+        return;
+      }
+
+      const hostname = window.location.hostname;
+      const pathname = window.location.pathname.replace(/^\/|\/$/g, '');
+      let found = [];
+
+      if (hostname.endsWith('github.io') && pathname) {
+        const owner = hostname.split('.')[0];
+        const repo = pathname.split('/')[0];
+        try {
+          const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`);
+          if (res.ok) {
+            const data = await res.json();
+            found = data
+              .filter(item => item.type === 'file' && (item.name.endsWith('.pdb') || item.name.endsWith('.pdb.gz')))
+              .map(item => item.name);
+          }
+        } catch (e) {}
+      }
+
+      dom.fileSelector.innerHTML = '';
+      if (found.length > 0) {
+        found.forEach(name => {
+          const opt = document.createElement('option');
+          opt.value = name;
+          opt.textContent = name;
+          dom.fileSelector.appendChild(opt);
+        });
+        loadPdbFile(found[0]);
+      } else {
+        dom.fileSelector.innerHTML = '<option value="" disabled selected>未偵測到結構檔案 (可加 ?file=檔名.pdb.gz)</option>';
+      }
+    }
+
+    function initEvents() {
+      dom.fileSelector.addEventListener('change', (e) => loadPdbFile(e.target.value));
+      dom.btnPlay.addEventListener('click', togglePlay);
+      dom.btnPrevFrame.addEventListener('click', () => { stopPlayback(); stepFrame(-1); });
+      dom.btnNextFrame.addEventListener('click', () => { stopPlayback(); stepFrame(1); });
+      dom.btnFirstFrame.addEventListener('click', () => { stopPlayback(); setFrame(0); });
+      dom.btnLastFrame.addEventListener('click', () => { stopPlayback(); setFrame(appState.totalFrames - 1); });
+      dom.slider.addEventListener('input', (e) => { stopPlayback(); setFrame(parseInt(e.target.value, 10)); });
+
+      dom.btnLoopMode.addEventListener('click', () => {
+        if (appState.loopMode === 'loop') {
+          appState.loopMode = 'rock';
+          dom.loopLabel.textContent = '往返';
+        } else if (appState.loopMode === 'rock') {
+          appState.loopMode = 'once';
+          dom.loopLabel.textContent = '單次';
+        } else {
+          appState.loopMode = 'loop';
+          dom.loopLabel.textContent = '循環';
+        }
+      });
+
+      dom.btnResetView.addEventListener('click', () => {
+        if (appState.component) appState.component.autoView(500);
+      });
+
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+        else if (e.code === 'ArrowRight') dom.btnNextFrame.click();
+        else if (e.code === 'ArrowLeft') dom.btnPrevFrame.click();
+        else if (e.key === 'r' || e.key === 'R') dom.btnResetView.click();
+      });
+    }
+
+    window.addEventListener('load', () => {
+      appState.stage = new NGL.Stage('viewport', {
+        backgroundColor: '#0b0f19',
+        cameraType: 'perspective'
+      });
+
+      window.addEventListener('resize', () => appState.stage.handleResize());
+      initEvents();
+      scanFolderFiles();
+    });
+  </script>
+</body>
+</html>
