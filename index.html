@@ -110,7 +110,7 @@
       fps: 15,
       origSS: null,
       ssSchemeIds: null,
-      zincAtomIndex: -1 // 精確抓取離子原子序號，防止 WebGL 緩衝區坐標脫節
+      zincAtomIndices: [] // 儲存所有鋅離子的 Atom Index 陣列
     };
 
     lucide.createIcons();
@@ -142,7 +142,7 @@
       dom.loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
     }
 
-    // 仿造原版 PyMOL 風格配色方案
+    // 註冊 PyMOL 風格配色方案
     function registerCustomColorSchemes() {
       const makeSS = (helix, sheet, loop) => {
         return function () {
@@ -160,7 +160,7 @@
       };
     }
 
-    // 仿造原版 β 摺疊末端立體箭頭修補
+    // β-sheet 末端立體箭頭修補
     function installArrowPatch() {
       try {
         const Cart = NGL.RepresentationRegistry.get('cartoon');
@@ -203,7 +203,7 @@
       } catch (e) { console.warn('無法安裝箭頭修補', e); }
     }
 
-    // Kabsch-Sander DSSP 二級結構氫鍵判定
+    // Kabsch-Sander DSSP 二級結構幾何判定
     function computeDSSP(structure) {
       const R = [];
       structure.eachResidue(r => {
@@ -315,24 +315,24 @@
       }
     }
 
-    // 掃描並找出鋅離子的確切 Atom Index
-    function findZincAtomIndex(structure) {
-      let zincIdx = -1;
+    // 收集「所有」鋅離子的 Atom Index
+    function findZincAtomIndices(structure) {
+      const indices = [];
       structure.eachResidue(r => {
         const rname = (r.resname || '').trim().toUpperCase();
         if (rname === 'ZN' || rname === 'ZN2' || rname === 'ZINC') {
-          r.eachAtom(a => { zincIdx = a.index; });
+          r.eachAtom(a => { indices.push(a.index); });
         }
       });
-      return zincIdx;
+      return indices;
     }
 
-    // 套用與完整版一致的精確表示法
+    // 建立所有表示法 (Cartoon 蛋白 / Cartoon DNA / Spacefill 鋅離子)
     function setupRepresentations() {
       if (!appState.component) return;
       appState.component.removeAllRepresentations();
 
-      // 1. 蛋白質主體：PyMOL 配色、光滑卡紙參數、排除雜原子與氫
+      // 1. 蛋白質主體
       appState.component.addRepresentation('cartoon', {
         sele: 'protein and not hydrogen and not (_ZN or :ZN or [ZN] or zinc)',
         colorScheme: appState.ssSchemeIds.pymol_ss,
@@ -343,7 +343,7 @@
         smoothSheet: true
       });
 
-      // 2. DNA 骨架絲帶
+      // 2. DNA 骨架
       appState.component.addRepresentation('cartoon', {
         sele: 'nucleic and not protein and not hydrogen and not (_ZN or :ZN or [ZN] or zinc)',
         color: '#7dd3fc',
@@ -355,10 +355,11 @@
         subdiv: 12
       });
 
-      // 3. 鋅離子 (ZN)：優先綁定單一原子序號 @index，確保行動端軌跡同步移動[cite: 2]
-      const znSele = (appState.zincAtomIndex >= 0) 
-        ? `@${appState.zincAtomIndex}` 
-        : '(_ZN or :ZN or [ZN] or zinc)';
+      // 3. 複數鋅離子：若有索引則組合成 (@idx1 or @idx2...)，防止行動端坐標脫節
+      let znSele = '(_ZN or :ZN or [ZN] or zinc)';
+      if (appState.zincAtomIndices && appState.zincAtomIndices.length > 0) {
+        znSele = appState.zincAtomIndices.map(idx => `@${idx}`).join(' or ');
+      }
 
       appState.component.addRepresentation('spacefill', {
         sele: znSele,
@@ -458,20 +459,20 @@
         appState.component = comp;
         appState.origSS = null;
 
-        // 命名標準化
+        // 殘基命名相容性替換
         comp.structure.eachResidue(r => {
           const rn = (r.resname || '').trim().toUpperCase();
           if (rn === 'CYM') r.resname = 'CYS';
           if (rn === 'HIE' || rn === 'HID' || rn === 'HIP') r.resname = 'HIS';
         });
 
-        // 1. 精準辨識鋅離子序號[cite: 2]
-        appState.zincAtomIndex = findZincAtomIndex(comp.structure);
+        // 1. 抓出所有鋅離子原子索引
+        appState.zincAtomIndices = findZincAtomIndices(comp.structure);
 
-        // 2. 重新計算 DSSP 二級結構[cite: 2]
+        // 2. 重新計算 DSSP 二級結構
         applySecondaryStructure();
 
-        // 3. 建立表示法[cite: 2]
+        // 3. 建立表示法
         setupRepresentations();
 
         comp.autoView(500);
@@ -481,7 +482,7 @@
         const trajectory = trajComp.trajectory;
         appState.trajectory = trajectory;
 
-        // 當軌跡幀變更時，強制通知視圖重繪以保證行動裝置各表示法座標同步
+        // 換幀時強制通知渲染引擎更新緩衝區
         trajectory.signals.frameChanged.add(function () {
           appState.stage.viewer.requestRender();
         });
@@ -511,7 +512,7 @@
       }
     }
 
-    // 自動搜尋 GitHub Pages 儲存庫檔案
+    // 自動搜尋 GitHub Pages 儲存庫根目錄檔案
     async function scanFolderFiles() {
       const urlParams = new URLSearchParams(window.location.search);
       const specifiedFile = urlParams.get('file') || urlParams.get('pdb');
@@ -588,7 +589,7 @@
       });
     }
 
-    // --- 初始化 Stage：完整仿造原版的燈光、霧氣與裁切參數 ---[cite: 2]
+    // 初始化 Stage 與精準燈光參數
     window.addEventListener('load', () => {
       registerCustomColorSchemes();
       installArrowPatch();
