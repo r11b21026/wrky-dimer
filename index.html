@@ -33,7 +33,7 @@
   <!-- 3D 渲染視窗 -->
   <div id="viewport" class="w-full h-full absolute inset-0 cursor-grab active:cursor-grabbing"></div>
 
-  <!-- 頂部選單與控制 -->
+  <!-- 頂部結構選單與重設視角 -->
   <header class="absolute top-3 left-3 right-3 z-20 flex items-center justify-between pointer-events-none">
     <div class="bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-xl px-3 py-1.5 flex items-center space-x-2 pointer-events-auto shadow-lg max-w-sm w-full">
       <i data-lucide="file" class="w-4 h-4 text-cyan-400 shrink-0"></i>
@@ -68,13 +68,11 @@
 
       <!-- 播放控制按鈕列 -->
       <div class="flex items-center justify-between w-full">
-        <!-- 循環模式 -->
         <button id="btn-loop-mode" class="px-2 py-1 rounded-lg text-xs font-mono bg-slate-800 border border-slate-700 text-cyan-400 hover:text-white transition flex items-center space-x-1">
           <i data-lucide="repeat" class="w-3 h-3"></i>
           <span id="loop-label">循環</span>
         </button>
 
-        <!-- 播放/暫停與前後步進 -->
         <div class="flex items-center space-x-1">
           <button id="btn-first-frame" class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-300 hover:text-white transition">
             <i data-lucide="skip-back" class="w-4 h-4"></i>
@@ -112,7 +110,7 @@
       fps: 15,
       origSS: null,
       ssSchemeIds: null,
-      strandT: new Map()
+      zincAtomIndex: -1 // 精確抓取離子原子序號，防止 WebGL 緩衝區坐標脫節
     };
 
     lucide.createIcons();
@@ -144,9 +142,7 @@
       dom.loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
     }
 
-    // --- 二級結構演算法 (DSSP & 著色配置) ---
-
-    // 註冊 PyMOL 風格配色：Helix 紅 (0xFF0000) / Sheet 黃 (0xFFFF00) / Loop 綠 (0x00E000)
+    // 仿造原版 PyMOL 風格配色方案
     function registerCustomColorSchemes() {
       const makeSS = (helix, sheet, loop) => {
         return function () {
@@ -164,7 +160,7 @@
       };
     }
 
-    // β-sheet 末端箭頭渲染修補
+    // 仿造原版 β 摺疊末端立體箭頭修補
     function installArrowPatch() {
       try {
         const Cart = NGL.RepresentationRegistry.get('cartoon');
@@ -207,7 +203,7 @@
       } catch (e) { console.warn('無法安裝箭頭修補', e); }
     }
 
-    // Kabsch-Sander DSSP 二級結構氫鍵判定運算
+    // Kabsch-Sander DSSP 二級結構氫鍵判定
     function computeDSSP(structure) {
       const R = [];
       structure.eachResidue(r => {
@@ -319,7 +315,59 @@
       }
     }
 
-    // --- 播放與幀數控制 ---
+    // 掃描並找出鋅離子的確切 Atom Index
+    function findZincAtomIndex(structure) {
+      let zincIdx = -1;
+      structure.eachResidue(r => {
+        const rname = (r.resname || '').trim().toUpperCase();
+        if (rname === 'ZN' || rname === 'ZN2' || rname === 'ZINC') {
+          r.eachAtom(a => { zincIdx = a.index; });
+        }
+      });
+      return zincIdx;
+    }
+
+    // 套用與完整版一致的精確表示法
+    function setupRepresentations() {
+      if (!appState.component) return;
+      appState.component.removeAllRepresentations();
+
+      // 1. 蛋白質主體：PyMOL 配色、光滑卡紙參數、排除雜原子與氫
+      appState.component.addRepresentation('cartoon', {
+        sele: 'protein and not hydrogen and not (_ZN or :ZN or [ZN] or zinc)',
+        colorScheme: appState.ssSchemeIds.pymol_ss,
+        aspectRatio: 5,
+        subdiv: 12,
+        radialSegments: 20,
+        capped: true,
+        smoothSheet: true
+      });
+
+      // 2. DNA 骨架絲帶
+      appState.component.addRepresentation('cartoon', {
+        sele: 'nucleic and not protein and not hydrogen and not (_ZN or :ZN or [ZN] or zinc)',
+        color: '#7dd3fc',
+        radiusType: 'size',
+        radiusSize: 0.6,
+        aspectRatio: 4,
+        tension: 0.3,
+        smoothSheet: false,
+        subdiv: 12
+      });
+
+      // 3. 鋅離子 (ZN)：優先綁定單一原子序號 @index，確保行動端軌跡同步移動[cite: 2]
+      const znSele = (appState.zincAtomIndex >= 0) 
+        ? `@${appState.zincAtomIndex}` 
+        : '(_ZN or :ZN or [ZN] or zinc)';
+
+      appState.component.addRepresentation('spacefill', {
+        sele: znSele,
+        color: '#94a3b8',
+        scale: 0.35
+      });
+    }
+
+    // --- 播放器與換幀控制 ---
 
     function setFrame(targetFrame) {
       if (!appState.trajectory) return;
@@ -393,7 +441,7 @@
       else startPlayback();
     }
 
-    // --- 結構載入與表示法設定 ---
+    // --- 結構載入邏輯 ---
 
     async function loadPdbFile(url) {
       stopPlayback();
@@ -410,48 +458,33 @@
         appState.component = comp;
         appState.origSS = null;
 
-        // 殘基命名相容性替換
+        // 命名標準化
         comp.structure.eachResidue(r => {
           const rn = (r.resname || '').trim().toUpperCase();
           if (rn === 'CYM') r.resname = 'CYS';
           if (rn === 'HIE' || rn === 'HID' || rn === 'HIP') r.resname = 'HIS';
         });
 
-        // 執行 DSSP 重算二級結構
+        // 1. 精準辨識鋅離子序號[cite: 2]
+        appState.zincAtomIndex = findZincAtomIndex(comp.structure);
+
+        // 2. 重新計算 DSSP 二級結構[cite: 2]
         applySecondaryStructure();
 
-        // 蛋白質 Cartoon 表示法（套用 PyMOL SS 配色與細緻度參數）
-        comp.addRepresentation('cartoon', {
-          sele: 'protein and not hydrogen',
-          colorScheme: appState.ssSchemeIds.pymol_ss,
-          aspectRatio: 5,
-          subdiv: 12,
-          radialSegments: 20,
-          capped: true,
-          smoothSheet: true
-        });
-
-        // 核酸 DNA 樣式
-        comp.addRepresentation('cartoon', {
-          sele: 'nucleic and not protein and not hydrogen',
-          color: '#7dd3fc',
-          aspectRatio: 4,
-          subdiv: 12
-        });
-
-        // 鋅離子 (ZN)
-        comp.addRepresentation('spacefill', {
-          sele: 'zinc or _ZN or :ZN or [ZN]',
-          color: '#94a3b8',
-          scale: 0.35
-        });
+        // 3. 建立表示法[cite: 2]
+        setupRepresentations();
 
         comp.autoView(500);
 
-        // 初始化軌跡監聽
+        // 4. 掛載動態軌跡
         const trajComp = comp.addTrajectory();
         const trajectory = trajComp.trajectory;
         appState.trajectory = trajectory;
+
+        // 當軌跡幀變更時，強制通知視圖重繪以保證行動裝置各表示法座標同步
+        trajectory.signals.frameChanged.add(function () {
+          appState.stage.viewer.requestRender();
+        });
 
         const handleCount = (count) => {
           if (count > 1) {
@@ -478,7 +511,7 @@
       }
     }
 
-    // 自動搜尋 GitHub Pages 儲存庫根目錄檔案
+    // 自動搜尋 GitHub Pages 儲存庫檔案
     async function scanFolderFiles() {
       const urlParams = new URLSearchParams(window.location.search);
       const specifiedFile = urlParams.get('file') || urlParams.get('pdb');
@@ -555,6 +588,7 @@
       });
     }
 
+    // --- 初始化 Stage：完整仿造原版的燈光、霧氣與裁切參數 ---[cite: 2]
     window.addEventListener('load', () => {
       registerCustomColorSchemes();
       installArrowPatch();
@@ -565,7 +599,12 @@
         ambientColor: 0xffffff,
         ambientIntensity: 0.55,
         lightColor: 0xffffff,
-        lightIntensity: 0.95
+        lightIntensity: 0.95,
+        clipNear: 0,
+        clipFar: 100,
+        fogNear: 100,
+        fogFar: 100,
+        sampleLevel: 0
       });
 
       window.addEventListener('resize', () => appState.stage.handleResize());
