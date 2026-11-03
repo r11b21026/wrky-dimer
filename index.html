@@ -27,13 +27,13 @@
       accent-color: #38bdf8;
     }
 
-    /* 將時間軸往上抬高，並避開手機底部的 Home Indicator 安全區 */
+    /* 時間軸往上抬高，並避開手機安全區 (Home Bar) */
     .custom-bottom-timeline {
-      bottom: calc(2.2rem + env(safe-area-inset-bottom, 0px));
+      bottom: calc(2.8rem + env(safe-area-inset-bottom, 0px));
     }
     @media (min-width: 640px) {
       .custom-bottom-timeline {
-        bottom: 1.5rem;
+        bottom: 1.8rem;
       }
     }
   </style>
@@ -65,7 +65,7 @@
     </div>
   </div>
 
-  <!-- 底部軌跡播放控制器（已提高位置） -->
+  <!-- 底部軌跡播放控制器（位置已抬高） -->
   <footer id="bottom-timeline" class="hidden absolute custom-bottom-timeline left-3 right-3 sm:left-12 sm:right-12 z-20 pointer-events-none flex flex-col items-center">
     <div class="bg-slate-900/95 backdrop-blur-md border border-slate-700/80 w-full max-w-lg rounded-2xl px-4 py-2.5 shadow-2xl pointer-events-auto flex flex-col gap-2">
       <!-- 幀數拉桿 -->
@@ -111,7 +111,6 @@
       stage: null,
       component: null,
       trajectory: null,
-      zincRepresentation: null, // 明確持有鋅離子的表示法物件
       totalFrames: 1,
       currentFrame: 0,
       isPlaying: false,
@@ -120,8 +119,7 @@
       timerId: null,
       fps: 15,
       origSS: null,
-      ssSchemeIds: null,
-      zincAtomIndices: []
+      ssSchemeIds: null
     };
 
     lucide.createIcons();
@@ -153,6 +151,7 @@
       dom.loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
     }
 
+    // 仿造 PyMOL 風格配色方案
     function registerCustomColorSchemes() {
       const makeSS = (helix, sheet, loop) => {
         return function () {
@@ -170,6 +169,7 @@
       };
     }
 
+    // 仿造 β-sheet 末端立體箭頭修補
     function installArrowPatch() {
       try {
         const Cart = NGL.RepresentationRegistry.get('cartoon');
@@ -212,6 +212,7 @@
       } catch (e) { console.warn('無法安裝箭頭修補', e); }
     }
 
+    // Kabsch-Sander DSSP 二級結構判定
     function computeDSSP(structure) {
       const R = [];
       structure.eachResidue(r => {
@@ -323,23 +324,12 @@
       }
     }
 
-    // 收集所有鋅離子的 Atom Index
-    function findZincAtomIndices(structure) {
-      const indices = [];
-      structure.eachResidue(r => {
-        const rname = (r.resname || '').trim().toUpperCase();
-        if (rname === 'ZN' || rname === 'ZN2' || rname === 'ZINC') {
-          r.eachAtom(a => { indices.push(a.index); });
-        }
-      });
-      return indices;
-    }
-
-    function setupRepresentations() {
+    // 仿造原版：重設並套用所有表示法（支援所有鋅離子）
+    function applyAllRepresentations() {
       if (!appState.component) return;
       appState.component.removeAllRepresentations();
 
-      // 1. 蛋白質主體
+      // 1. 蛋白質主體 (PyMOL SS 配色)
       appState.component.addRepresentation('cartoon', {
         sele: 'protein and not hydrogen and not (_ZN or :ZN or [ZN] or zinc)',
         colorScheme: appState.ssSchemeIds.pymol_ss,
@@ -350,7 +340,7 @@
         smoothSheet: true
       });
 
-      // 2. DNA 骨架
+      // 2. DNA 雙螺旋
       appState.component.addRepresentation('cartoon', {
         sele: 'nucleic and not protein and not hydrogen and not (_ZN or :ZN or [ZN] or zinc)',
         color: '#7dd3fc',
@@ -362,20 +352,15 @@
         subdiv: 12
       });
 
-      // 3. 複數鋅離子表示法
-      let znSele = '(_ZN or :ZN or [ZN] or zinc)';
-      if (appState.zincAtomIndices && appState.zincAtomIndices.length > 0) {
-        znSele = appState.zincAtomIndices.map(idx => `@${idx}`).join(' or ');
-      }
-
-      appState.zincRepresentation = appState.component.addRepresentation('spacefill', {
-        sele: znSele,
+      // 3. 所有鋅離子：原版原汁原味的通用字串選取式
+      appState.component.addRepresentation('spacefill', {
+        sele: '_ZN or :ZN or [ZN] or zinc',
         color: '#94a3b8',
         scale: 0.35
       });
     }
 
-    // 換幀函式：加入強制作標刷新，解決行動端 Spacefill 定格問題
+    // 換幀函式：仿造原版，切換幀時直接重新套用表示法，徹底根除行動端 Spacefill 定格
     function setFrame(targetFrame) {
       if (!appState.trajectory || !appState.component) return;
       const maxF = appState.totalFrames - 1;
@@ -384,15 +369,8 @@
       appState.currentFrame = f;
       appState.trajectory.setFrame(f);
 
-      // 強制讓結構坐標緩衝區同步最新幀位置
-      if (appState.component.structure && appState.component.structure.refreshPosition) {
-        appState.component.structure.refreshPosition();
-      }
-
-      // 明確觸發鋅離子表示法的內部緩衝區重算
-      if (appState.zincRepresentation) {
-        appState.zincRepresentation.update({ position: true });
-      }
+      // 【核心關鍵】：換幀時重新繪製表示法，強制 WebGL 重建 Spacefill 的 Buffer 座標
+      applyAllRepresentations();
 
       dom.slider.value = f;
       dom.sliderCurr.textContent = f;
@@ -479,14 +457,11 @@
           if (rn === 'HIE' || rn === 'HID' || rn === 'HIP') r.resname = 'HIS';
         });
 
-        // 辨識所有鋅離子
-        appState.zincAtomIndices = findZincAtomIndices(comp.structure);
-
         // 重新計算 DSSP 二級結構
         applySecondaryStructure();
 
-        // 建立 Cartoon 與 Spacefill 表示法
-        setupRepresentations();
+        // 建立初始表示法
+        applyAllRepresentations();
 
         comp.autoView(500);
 
@@ -494,14 +469,6 @@
         const trajComp = comp.addTrajectory();
         const trajectory = trajComp.trajectory;
         appState.trajectory = trajectory;
-
-        // 幀變更時強制呼叫全域 WebGL 渲染
-        trajectory.signals.frameChanged.add(function () {
-          if (appState.zincRepresentation) {
-            appState.zincRepresentation.update({ position: true });
-          }
-          appState.stage.viewer.requestRender();
-        });
 
         const handleCount = (count) => {
           if (count > 1) {
@@ -606,6 +573,7 @@
       });
     }
 
+    // 初始化 Stage 與原版光影參數
     window.addEventListener('load', () => {
       registerCustomColorSchemes();
       installArrowPatch();
