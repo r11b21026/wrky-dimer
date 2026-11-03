@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>分子軌跡播放器</title>
   <!-- Tailwind CSS & Lucide Icons -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -25,6 +25,16 @@
     }
     input[type=range] {
       accent-color: #38bdf8;
+    }
+
+    /* 將時間軸往上抬高，並避開手機底部的 Home Indicator 安全區 */
+    .custom-bottom-timeline {
+      bottom: calc(2.2rem + env(safe-area-inset-bottom, 0px));
+    }
+    @media (min-width: 640px) {
+      .custom-bottom-timeline {
+        bottom: 1.5rem;
+      }
     }
   </style>
 </head>
@@ -55,8 +65,8 @@
     </div>
   </div>
 
-  <!-- 底部軌跡播放控制器 -->
-  <footer id="bottom-timeline" class="hidden absolute bottom-4 left-3 right-3 sm:left-12 sm:right-12 z-20 pointer-events-none flex flex-col items-center">
+  <!-- 底部軌跡播放控制器（已提高位置） -->
+  <footer id="bottom-timeline" class="hidden absolute custom-bottom-timeline left-3 right-3 sm:left-12 sm:right-12 z-20 pointer-events-none flex flex-col items-center">
     <div class="bg-slate-900/95 backdrop-blur-md border border-slate-700/80 w-full max-w-lg rounded-2xl px-4 py-2.5 shadow-2xl pointer-events-auto flex flex-col gap-2">
       <!-- 幀數拉桿 -->
       <div class="flex items-center space-x-2.5 w-full font-mono text-xs">
@@ -101,6 +111,7 @@
       stage: null,
       component: null,
       trajectory: null,
+      zincRepresentation: null, // 明確持有鋅離子的表示法物件
       totalFrames: 1,
       currentFrame: 0,
       isPlaying: false,
@@ -110,7 +121,7 @@
       fps: 15,
       origSS: null,
       ssSchemeIds: null,
-      zincAtomIndices: [] // 儲存所有鋅離子的 Atom Index 陣列
+      zincAtomIndices: []
     };
 
     lucide.createIcons();
@@ -142,7 +153,6 @@
       dom.loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
     }
 
-    // 註冊 PyMOL 風格配色方案
     function registerCustomColorSchemes() {
       const makeSS = (helix, sheet, loop) => {
         return function () {
@@ -160,7 +170,6 @@
       };
     }
 
-    // β-sheet 末端立體箭頭修補
     function installArrowPatch() {
       try {
         const Cart = NGL.RepresentationRegistry.get('cartoon');
@@ -203,7 +212,6 @@
       } catch (e) { console.warn('無法安裝箭頭修補', e); }
     }
 
-    // Kabsch-Sander DSSP 二級結構幾何判定
     function computeDSSP(structure) {
       const R = [];
       structure.eachResidue(r => {
@@ -315,7 +323,7 @@
       }
     }
 
-    // 收集「所有」鋅離子的 Atom Index
+    // 收集所有鋅離子的 Atom Index
     function findZincAtomIndices(structure) {
       const indices = [];
       structure.eachResidue(r => {
@@ -327,7 +335,6 @@
       return indices;
     }
 
-    // 建立所有表示法 (Cartoon 蛋白 / Cartoon DNA / Spacefill 鋅離子)
     function setupRepresentations() {
       if (!appState.component) return;
       appState.component.removeAllRepresentations();
@@ -355,28 +362,37 @@
         subdiv: 12
       });
 
-      // 3. 複數鋅離子：若有索引則組合成 (@idx1 or @idx2...)，防止行動端坐標脫節
+      // 3. 複數鋅離子表示法
       let znSele = '(_ZN or :ZN or [ZN] or zinc)';
       if (appState.zincAtomIndices && appState.zincAtomIndices.length > 0) {
         znSele = appState.zincAtomIndices.map(idx => `@${idx}`).join(' or ');
       }
 
-      appState.component.addRepresentation('spacefill', {
+      appState.zincRepresentation = appState.component.addRepresentation('spacefill', {
         sele: znSele,
         color: '#94a3b8',
         scale: 0.35
       });
     }
 
-    // --- 播放器與換幀控制 ---
-
+    // 換幀函式：加入強制作標刷新，解決行動端 Spacefill 定格問題
     function setFrame(targetFrame) {
-      if (!appState.trajectory) return;
+      if (!appState.trajectory || !appState.component) return;
       const maxF = appState.totalFrames - 1;
       let f = Math.max(0, Math.min(targetFrame, maxF));
 
       appState.currentFrame = f;
       appState.trajectory.setFrame(f);
+
+      // 強制讓結構坐標緩衝區同步最新幀位置
+      if (appState.component.structure && appState.component.structure.refreshPosition) {
+        appState.component.structure.refreshPosition();
+      }
+
+      // 明確觸發鋅離子表示法的內部緩衝區重算
+      if (appState.zincRepresentation) {
+        appState.zincRepresentation.update({ position: true });
+      }
 
       dom.slider.value = f;
       dom.sliderCurr.textContent = f;
@@ -442,8 +458,6 @@
       else startPlayback();
     }
 
-    // --- 結構載入邏輯 ---
-
     async function loadPdbFile(url) {
       stopPlayback();
       showLoading(`載入結構中: ${url}`);
@@ -459,31 +473,33 @@
         appState.component = comp;
         appState.origSS = null;
 
-        // 殘基命名相容性替換
         comp.structure.eachResidue(r => {
           const rn = (r.resname || '').trim().toUpperCase();
           if (rn === 'CYM') r.resname = 'CYS';
           if (rn === 'HIE' || rn === 'HID' || rn === 'HIP') r.resname = 'HIS';
         });
 
-        // 1. 抓出所有鋅離子原子索引
+        // 辨識所有鋅離子
         appState.zincAtomIndices = findZincAtomIndices(comp.structure);
 
-        // 2. 重新計算 DSSP 二級結構
+        // 重新計算 DSSP 二級結構
         applySecondaryStructure();
 
-        // 3. 建立表示法
+        // 建立 Cartoon 與 Spacefill 表示法
         setupRepresentations();
 
         comp.autoView(500);
 
-        // 4. 掛載動態軌跡
+        // 初始化動態軌跡
         const trajComp = comp.addTrajectory();
         const trajectory = trajComp.trajectory;
         appState.trajectory = trajectory;
 
-        // 換幀時強制通知渲染引擎更新緩衝區
+        // 幀變更時強制呼叫全域 WebGL 渲染
         trajectory.signals.frameChanged.add(function () {
+          if (appState.zincRepresentation) {
+            appState.zincRepresentation.update({ position: true });
+          }
           appState.stage.viewer.requestRender();
         });
 
@@ -493,11 +509,13 @@
             dom.slider.max = count - 1;
             dom.sliderTotal.textContent = String(count - 1);
             dom.bottomTimeline.classList.remove('hidden');
+            dom.bottomTimeline.classList.add('flex');
             setFrame(0);
             startPlayback();
           } else {
             appState.totalFrames = 1;
             dom.bottomTimeline.classList.add('hidden');
+            dom.bottomTimeline.classList.remove('flex');
           }
         };
 
@@ -512,7 +530,6 @@
       }
     }
 
-    // 自動搜尋 GitHub Pages 儲存庫根目錄檔案
     async function scanFolderFiles() {
       const urlParams = new URLSearchParams(window.location.search);
       const specifiedFile = urlParams.get('file') || urlParams.get('pdb');
@@ -589,7 +606,6 @@
       });
     }
 
-    // 初始化 Stage 與精準燈光參數
     window.addEventListener('load', () => {
       registerCustomColorSchemes();
       installArrowPatch();
